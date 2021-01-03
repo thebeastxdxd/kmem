@@ -2,15 +2,22 @@
 #include <linux/kernel.h>        /* Needed for KERN_INFO  */
 #include <linux/init.h>          /* Needed for the macros */
 #include <linux/fs.h>
+#include <linux/types.h>
+#include <linux/kdev_t.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <asm/uaccess.h>
+
+#define DRIVER_AUTHOR "ido ben amram"
+#define DRIVER_DESC "read and write to kernel memory"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_VERSION("0.1");
 
-#define DRIVER_AUTHOR "ido ben amram"
-#define DRIVER_DESC "read and write to kernel memory"
 #define SUCCESS (0)
 #define DEVICE_NAME "kmem"
 #define CLASS_NAME "kmem"
@@ -22,6 +29,7 @@ static int device_open(struct inode*, struct file*);
 static int device_release(struct inode*, struct file*);
 static ssize_t device_read(struct file*, char*, size_t, loff_t*);
 static ssize_t device_write(struct file*, const char*, size_t, loff_t*);
+static loff_t device_llseek(struct file*, loff_t, int);
 
 /* 
  * Global variables are declared as static, so are global within the file.
@@ -29,12 +37,13 @@ static ssize_t device_write(struct file*, const char*, size_t, loff_t*);
 
 static int major;                /* Major number assigned to our device driver */
 static int num_opens = 0;     
+static dev_t kmem_device = {0};
 static struct class* kmem_class = NULL;
-static struct device* kmem_device = NULL;
-static char msg[BUF_LEN];        /* The msg the device will give when asked */
-static char *msg_ptr;
+static struct cdev* kmem_cdev = NULL;
 
 static struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.llseek = device_llseek,
 	.read = device_read,
 	.write = device_write,
 	.open = device_open,
@@ -43,49 +52,66 @@ static struct file_operations fops = {
 
 
 
-static int __init chardev_init(void) {
+static int __init kmem_init(void) {
 	
+	int err = 0;
+	struct device* dev_ret = NULL;
 	printk(KERN_INFO "kmem: Initializing the kmem LKM\n");
 
-	// the 0 in the major number is so that the kernel dynamically returns the assigned major
-	major = register_chrdev(0, DEVICE_NAME, &fops);
-
+	
+	major = alloc_chrdev_region(&kmem_device,
+				    0, // first minor number
+				    1, // count
+				    DEVICE_NAME);
 	if (major < 0) {
 		printk(KERN_ALERT "Registering kmem failed with &d\n", major);
 		return major;
 	}
+
 	// Register the device class
 	kmem_class = class_create(THIS_MODULE, CLASS_NAME);
 	if (IS_ERR(kmem_class)) {
-		class_destroy(kmem_class);
-		unregister_chrdev(major, DEVICE_NAME);
+		unregister_chrdev_region(kmem_device, 1);
 		printk(KERN_ALERT "Failed to create the device\n");
 		return PTR_ERR(kmem_class);
 	}
 
 	// Register the device driver
-	kmem_device = device_create(kmem_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-	if (IS_ERR(kmem_device)){
+	dev_ret  = device_create(kmem_class, NULL, kmem_device, NULL, DEVICE_NAME);
+	if (IS_ERR(dev_ret)){
 		class_destroy(kmem_class);
-		unregister_chrdev(major, DEVICE_NAME);
+		unregister_chrdev_region(kmem_device, 1);
 		printk(KERN_ALERT "Failed to create the device\n");
-		return PTR_ERR(kmem_class);
+		return PTR_ERR(dev_ret);
+	}
+
+	cdev_init(kmem_cdev, &fops);
+	kmem_cdev->owner = THIS_MODULE;
+	kmem_cdev->ops = &fops;
+	err = cdev_add(kmem_cdev, kmem_device, 1);
+	if(err) {
+		device_destroy(kmem_class, kmem_device);
+		class_unregister(kmem_class);
+		class_destroy(kmem_class);
+		unregister_chrdev_region(kmem_device, 1);
+		return err;
+	
 	}
 
 	printk(KERN_INFO "kmem: device class created correctly\n");
 	return SUCCESS;
 }
 
-static void __exit chardev_cleanup(void) {
+static void __exit kmem_cleanup(void) {
 	device_destroy(kmem_class, MKDEV(major, 0));
 	class_unregister(kmem_class);
-	class_destory(kmem_class);
-	unregister_chrdev(major, DEVICE_NAME);
+	class_destroy(kmem_class);
+	unregister_chrdev_region(kmem_device, 1);
 	printk(KERN_INFO "kmem: Goodbye fomr the LVM!\n");
 }
 
 
-static int device_open(struct inode* inode, struct file* file) {
+static int device_open(struct inode* inode, struct file* filp) {
 
 	num_opens++;
 	printk(KERN_INFO "kmem: Device has been opened %d times(s)\n", num_opens);	
@@ -93,23 +119,56 @@ static int device_open(struct inode* inode, struct file* file) {
 
 }
 
-static int device_release(struct inode* inode, struct file* file) {
+static int device_release(struct inode* inode, struct file* filp) {
 
-	is_device_open--;
-
-	module_put(THIS_MODULE);
-
+	num_opens--;
+	printk(KERN_INFO "kmem closed");	
 	return 0;
+
+}
+static loff_t device_llseek(struct file* filp, loff_t off, int whence) {
+
+	loff_t newpos = {0};
+
+	switch(whence) {
+		
+		case 0: // SEEK_SET
+			newpos = off;
+			break;
+		
+		case 1: // SEEK_CUR
+			newpos = filp->f_pos + off;
+			break;
+
+		case 2: // SEEK_END
+		default:
+			return -EINVAL;
+	}
+
+	if (newpos < 0)
+		return -EINVAL;
+	filp->f_pos = newpos;
+	return newpos;
 
 }
 
 static ssize_t device_read(struct file* filp,
 			   char* buffer,
 			   size_t length,
-			   loff_t* offset) {
+			   loff_t* f_pos) {
 
 	int bytes_read = 0;
+	char* kern_buff = (char*)kmalloc(length, GFP_KERNEL);
+	if (kern_buff == NULL)
+		return -1;
 
+	while (bytes_read < length) {
+		kern_buff[bytes_read] = *((char*)f_pos);
+	}
+	copy_to_user(buffer, kern_buff, bytes_read);
+	*f_pos += bytes_read;
+
+	kfree(kern_buff);
 	return bytes_read;
 
 }
@@ -121,5 +180,5 @@ static ssize_t device_write(struct file* filp, const char* buff, size_t len, lof
 
 }
 
-module_init(chardev_init);
-module_exit(chardev_cleanup);
+module_init(kmem_init);
+module_exit(kmem_cleanup);
